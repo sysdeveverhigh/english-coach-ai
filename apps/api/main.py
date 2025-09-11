@@ -1,10 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 from pydantic_settings import BaseSettings
 from fastapi.middleware.cors import CORSMiddleware
 import httpx, os, asyncio
 
 class Settings(BaseSettings):
-    OPENAI_API_KEY: str = ""
+    OPENAI_API_KEY: str =  os.getenv("OPENAI_API_KEY", "")
     SUPABASE_URL: str = ""
     SUPABASE_ANON_KEY: str = ""
     APP_ENV: str = "dev"
@@ -16,7 +17,7 @@ app = FastAPI()
 # Ajusta origins para tu dominio web en Vercel
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://coach.everhighit.com"],
+    allow_origins=["https://english-coach-ai.onrender.com", "http://localhost:3000", "https://coach.everhighit.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
