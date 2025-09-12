@@ -63,3 +63,55 @@ async def asr(audio: UploadFile = File(...), language: str = Form("en")):
     except Exception as e:
         print("ASR EXCEPTION", repr(e))
         return JSONResponse({"error": "server_exception", "detail": str(e)}, status_code=500)
+from fastapi import Form
+
+@app.post("/chat")
+async def chat(prompt: str = Form(...), language: str = Form("en")):
+    if not OPENAI_API_KEY:
+        return JSONResponse({"error": "OPENAI_API_KEY is empty"}, status_code=500)
+
+    system = "You are a concise, encouraging language coach. Correct grammar, give 1–2 short examples."
+    if language == "es":
+        system = "Eres un coach de idiomas conciso y motivador. Corrige gramática y da 1–2 ejemplos breves."
+
+    body = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ]
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json=body
+        )
+    if r.status_code != 200:
+        return JSONResponse({"error": "openai_chat_failed", "detail": r.text}, status_code=500)
+
+    out = r.json()
+    text = out["choices"][0]["message"]["content"]
+    return {"text": text}
+
+from fastapi.responses import StreamingResponse
+
+@app.post("/tts")
+async def tts(text: str = Form(...), voice: str = Form("alloy"), format: str = Form("mp3")):
+    if not OPENAI_API_KEY:
+        return JSONResponse({"error": "OPENAI_API_KEY is empty"}, status_code=500)
+
+    data = {"model": "gpt-4o-mini-tts", "voice": voice, "input": text, "format": format}
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json=data
+        )
+    if r.status_code != 200:
+        return JSONResponse({"error": "openai_tts_failed", "detail": r.text}, status_code=500)
+
+    media = "audio/mpeg" if format == "mp3" else "audio/wav"
+    return StreamingResponse(iter([r.content]), media_type=media)
+
