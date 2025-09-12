@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
-import QRCode from "qrcode.react";
+import { QRCodeCanvas } from "qrcode.react";
 
 type Step = "login" | "mfa_challenge" | "mfa_enroll" | "mfa_verify" | "done";
 
@@ -127,7 +127,7 @@ export default function LoginPage() {
           <p className="text-sm">Escanea este QR con Google Authenticator / Authy y luego introduce el código de 6 dígitos.</p>
           {otpUri && (
             <div className="border rounded p-3 inline-block">
-              <QRCode value={otpUri} size={180} />
+              <QRCodeCanvas value={otpUri} size={180} />
             </div>
           )}
           <input
