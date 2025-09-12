@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { QRCodeCanvas } from "qrcode.react";
 
-type Step = "login" | "mfa_challenge" | "mfa_enroll" | "mfa_verify" | "done";
+type Step = "login" | "mfa_challenge" | "mfa_enroll";
 
 export default function LoginPage() {
   const [step, setStep] = useState<Step>("login");
@@ -21,8 +21,8 @@ export default function LoginPage() {
 
   useEffect(() => {
     (async () => {
-      const { data } = await supabase.auth.getSession();
-      if (data.session) window.location.href = "/app";
+      const sessionRes = await supabase.auth.getSession();
+      if (sessionRes.data?.session) window.location.href = "/app";
     })();
   }, []);
 
@@ -30,14 +30,14 @@ export default function LoginPage() {
     try {
       setError(null);
       setStatus("Autenticando…");
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) {
-        // si la instancia devuelve mensaje relacionado a MFA, continuamos flujo
-        if (error.message?.toLowerCase().includes("mfa")) {
+      const signInRes = await supabase.auth.signInWithPassword({ email, password });
+      if (signInRes.error) {
+        // si el proveedor devuelve mensaje relacionado a MFA, continuamos flujo
+        if (signInRes.error.message?.toLowerCase().includes("mfa")) {
           await routeAfterLogin();
           return;
         }
-        setError(error.message);
+        setError(signInRes.error.message);
         setStatus("");
         return;
       }
@@ -51,14 +51,14 @@ export default function LoginPage() {
 
   const routeAfterLogin = async () => {
     setStatus("Comprobando MFA…");
-    const { data: factorsData, error: fErr } = await supabase.auth.mfa.listFactors();
-    if (fErr) {
-      setError(fErr.message);
+    const factorsRes = await supabase.auth.mfa.listFactors();
+    if (factorsRes.error) {
+      setError(factorsRes.error.message);
       setStatus("");
       return;
     }
 
-    const totpVerified = factorsData?.all?.find(
+    const totpVerified = factorsRes.data?.all?.find(
       (f) => f.factor_type === "totp" && f.status === "verified"
     );
     if (totpVerified) {
@@ -68,23 +68,23 @@ export default function LoginPage() {
       return;
     }
 
-    const { data: enrollData, error: eErr } = await supabase.auth.mfa.enroll({ factorType: "totp" });
-    if (eErr) {
-      setError(eErr.message);
+    const enrollRes = await supabase.auth.mfa.enroll({ factorType: "totp" });
+    if (enrollRes.error) {
+      setError(enrollRes.error.message);
       setStatus("");
       return;
     }
-    setEnrollId(enrollData.id);
-    setOtpUri(enrollData.totp?.uri || "");
+    setEnrollId(enrollRes.data.id);
+    setOtpUri(enrollRes.data.totp?.uri || "");
     setStep("mfa_enroll");
     setStatus("");
   };
 
   const verifyEnrollment = async () => {
     setStatus("Verificando TOTP…");
-    const { error } = await supabase.auth.mfa.verify({ factorId: enrollId, code: otpCode });
-    if (error) {
-      setError(error.message);
+    const verifyRes = await supabase.auth.mfa.verify({ factorId: enrollId, code: otpCode });
+    if (verifyRes.error) {
+      setError(verifyRes.error.message);
     } else {
       window.location.href = "/app";
     }
@@ -93,21 +93,21 @@ export default function LoginPage() {
 
   const startChallenge = async () => {
     setStatus("Creando desafío MFA…");
-    const { data, error } = await supabase.auth.mfa.challenge({ factorId: verifiedFactorId });
-    if (error) {
-      setError(error.message);
+    const challengeRes = await supabase.auth.mfa.challenge({ factorId: verifiedFactorId });
+    if (challengeRes.error) {
+      setError(challengeRes.error.message);
       setStatus("");
       return;
     }
-    setChallengeId(data.id);
+    setChallengeId(challengeRes.data.id);
     setStatus("");
   };
 
   const verifyChallenge = async () => {
     setStatus("Verificando código…");
-    const { error } = await supabase.auth.mfa.verify({ factorId: challengeId, code: otpCode });
-    if (error) {
-      setError(error.message);
+    const verifyRes = await supabase.auth.mfa.verify({ factorId: challengeId, code: otpCode });
+    if (verifyRes.error) {
+      setError(verifyRes.error.message);
     } else {
       window.location.href = "/app";
     }
