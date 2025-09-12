@@ -4,6 +4,7 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx, os
+import re
 
 # ---- CONFIG ----
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -77,38 +78,54 @@ async def asr(audio: UploadFile = File(...), language: str = Form("en")):
         return JSONResponse({"error": "server_exception", "detail": str(e)}, status_code=500)
 
 
-# ---- CHAT (Correcciones bilingües guiadas) ----
+# ---- CHAT (Correcciones bilingües guiadas y humanizador de texto) ----
+def clean_for_speech(text: str) -> str:
+    """
+    Quita bullets, numeraciones y markdown que suenan robóticos en TTS.
+    Convierte a un párrafo fluido.
+    """
+    # quita bullets tipo "-", "*", "•", "–" al inicio de línea
+    text = re.sub(r'^\s*[-*•–]\s+', '', text, flags=re.MULTILINE)
+    # quita numeraciones "1) ", "2. ", "3 - " al inicio de línea
+    text = re.sub(r'^\s*\d+[\)\.\-:]\s+', '', text, flags=re.MULTILINE)
+    # colapsa múltiples saltos de línea a uno
+    text = re.sub(r'\n{2,}', '\n', text)
+    # si aún quedan saltos, junta a un párrafo corto
+    text = ' '.join(line.strip() for line in text.splitlines())
+    # cleanup espacios múltiples
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
+
 @app.post("/chat")
 async def chat(
     prompt: str = Form(...),
-    native_language: str = Form("es"),   # p.ej. "es"
-    target_language: str = Form("en")    # p.ej. "en"
+    native_language: str = Form("es"),   # "es" para explicaciones
+    target_language: str = Form("en")    # "en" para práctica
 ):
     if not OPENAI_API_KEY:
         return JSONResponse({"error": "OPENAI_API_KEY is empty"}, status_code=500)
 
+    # Instrucciones: tono cálido, 2–4 frases, nada de listas ni numeración.
     system = (
-        "You are a concise, encouraging language coach. "
-        "Explain in the student's NATIVE language, but always include corrected TARGET-language sentences and brief phonetic/intonation hints. "
-        "Format:\n"
-        "1) Breve evaluación en NATIVE\n"
-        "2) Corrección en TARGET\n"
-        "3) Pista fonética/ritmo en NATIVE\n"
-        "4) 1–2 ejemplos alternativos en TARGET\n"
-        "Keep it under 80–120 words."
+        "You are a warm, human language coach. Speak naturally, like a friendly teacher.\n"
+        "Rules:\n"
+        "- Write a single short paragraph (2–4 sentences). No lists. No numbering. No headings.\n"
+        f"- Explain in the student's NATIVE language.\n"
+        "- Include the corrected TARGET-language sentence inline (surrounded by quotes) and give a brief phonetic/intonation hint.\n"
+        "- Keep it concise and encouraging."
+    )
+
+    user_content = (
+        f"NATIVE={native_language}; TARGET={target_language}; "
+        f"Student just said (in TARGET): {prompt}"
     )
 
     body = {
         "model": "gpt-4o-mini",
+        "temperature": 0.5,  # un poco de calidez
         "messages": [
             {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": (
-                    f"NATIVE={native_language}; TARGET={target_language}; "
-                    f"Texto del estudiante (TARGET): {prompt}"
-                )
-            }
+            {"role": "user", "content": user_content}
         ]
     }
 
@@ -121,8 +138,9 @@ async def chat(
         return JSONResponse({"error": "openai_chat_failed", "detail": r.text}, status_code=500)
 
     out = r.json()
-    text = out["choices"][0]["message"]["content"]
-    return {"text": text}
+    raw = out["choices"][0]["message"]["content"]
+    natural = clean_for_speech(raw)
+    return {"text": natural}
 
 # ---- TTS (Audio de respuesta) ----
 @app.post("/tts")
