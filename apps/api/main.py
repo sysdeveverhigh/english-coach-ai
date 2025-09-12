@@ -76,27 +76,39 @@ async def asr(audio: UploadFile = File(...), language: str = Form("en")):
         print("ASR EXCEPTION", repr(e))
         return JSONResponse({"error": "server_exception", "detail": str(e)}, status_code=500)
 
-# ---- CHAT (Correcciones) ----
+
+# ---- CHAT (Correcciones bilingües guiadas) ----
 @app.post("/chat")
-async def chat(prompt: str = Form(...), language: str = Form("en")):
+async def chat(
+    prompt: str = Form(...),
+    native_language: str = Form("es"),   # p.ej. "es"
+    target_language: str = Form("en")    # p.ej. "en"
+):
     if not OPENAI_API_KEY:
         return JSONResponse({"error": "OPENAI_API_KEY is empty"}, status_code=500)
 
     system = (
         "You are a concise, encouraging language coach. "
-        "Correct grammar, pronunciation hints, and provide 1–2 short examples."
+        "Explain in the student's NATIVE language, but always include corrected TARGET-language sentences and brief phonetic/intonation hints. "
+        "Format:\n"
+        "1) Breve evaluación en NATIVE\n"
+        "2) Corrección en TARGET\n"
+        "3) Pista fonética/ritmo en NATIVE\n"
+        "4) 1–2 ejemplos alternativos en TARGET\n"
+        "Keep it under 80–120 words."
     )
-    if language == "es":
-        system = (
-            "Eres un coach de idiomas conciso y motivador. "
-            "Corrige gramática, da pistas de pronunciación y 1–2 ejemplos breves."
-        )
 
     body = {
         "model": "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": prompt}
+            {
+                "role": "user",
+                "content": (
+                    f"NATIVE={native_language}; TARGET={target_language}; "
+                    f"Texto del estudiante (TARGET): {prompt}"
+                )
+            }
         ]
     }
 
