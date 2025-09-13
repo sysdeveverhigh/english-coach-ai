@@ -143,12 +143,43 @@ async def chat(
     return {"text": natural}
 
 # ---- TTS (Audio de respuesta) ----
+def pace_slow(text: str) -> str:
+    """
+    Inserta pausas suaves para que el TTS suene más pausado.
+    Estrategia simple: coma cada 2–3 palabras y puntos suaves al final de frases.
+    """
+    # Normaliza espacios
+    text = re.sub(r'\s+', ' ', text).strip()
+    words = text.split(' ')
+    out = []
+    count = 0
+    for w in words:
+        out.append(w)
+        count += 1
+        if count in (2, 5, 8):
+            out.append(',')  # pausas cortas
+        if count >= 10:
+            out.append('.')
+            count = 0
+    s = ' '.join(out)
+    # Limpia posibles ", ." secuencias
+    s = re.sub(r'\s+,', ', ', s)
+    s = re.sub(r'\s+\.', '. ', s)
+    return s.strip()
+
 @app.post("/tts")
-async def tts(text: str = Form(...), voice: str = Form("alloy"), format: str = Form("mp3")):
+async def tts(
+    text: str = Form(...),
+    voice: str = Form("alloy"),
+    format: str = Form("mp3"),
+    pace: str = Form("normal"),  # <-- nuevo: "normal" | "slow"
+):
     if not OPENAI_API_KEY:
         return JSONResponse({"error": "OPENAI_API_KEY is empty"}, status_code=500)
 
-    data = {"model": "gpt-4o-mini-tts", "voice": voice, "input": text, "format": format}
+    speak_text = text if pace == "normal" else pace_slow(text)
+
+    data = {"model": "gpt-4o-mini-tts", "voice": voice, "input": speak_text, "format": format}
     r = await http_client.post(
         "https://api.openai.com/v1/audio/speech",
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
@@ -159,4 +190,3 @@ async def tts(text: str = Form(...), voice: str = Form("alloy"), format: str = F
 
     media = "audio/mpeg" if format == "mp3" else "audio/wav"
     return StreamingResponse(iter([r.content]), media_type=media)
-
