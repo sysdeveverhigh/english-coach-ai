@@ -22,7 +22,12 @@ export default function Home() {
   const [status, setStatus] = useState("");
   const [text, setText] = useState("");
   const [reply, setReply] = useState("");
-  const [audioURL, setAudioURL] = useState<string>("");
+
+  // Doble TTS
+  const [audioURLA, setAudioURLA] = useState<string>(""); // Explicación (nativo)
+  const [audioURLB, setAudioURLB] = useState<string>(""); // Frase corregida (meta, lento)
+  const audioRefA = useRef<HTMLAudioElement | null>(null);
+  const audioRefB = useRef<HTMLAudioElement | null>(null);
 
   // Timer
   const [timerLeft, setTimerLeft] = useState<number>(MAX_MS / 1000);
@@ -51,6 +56,14 @@ export default function Home() {
       setProfile(p as Profile);
     })();
   }, []);
+
+  // Cuando termina el audio A, autoinicia el B
+  const onEndedA = () => {
+    if (audioRefB.current && audioURLB) {
+      audioRefB.current.currentTime = 0;
+      audioRefB.current.play().catch(() => {});
+    }
+  };
 
   const pickMime = () => {
     if (typeof MediaRecorder === "undefined") return undefined;
@@ -82,11 +95,24 @@ export default function Home() {
     }
   };
 
-  // ---- Procesamiento del blob capturado
+  // ---- Util: extraer frase corregida entre comillas
+  const extractCorrected = (s: string): string => {
+    const m = s.match(/"([^"]+)"/);
+    if (m && m[1]) return m[1];
+    // fallback: intenta comillas simples
+    const m2 = s.match(/'([^']+)'/);
+    if (m2 && m2[1]) return m2[1];
+    // si no hay comillas, usa la última oración del texto
+    const parts = s.split(/[\.\!\?]/).map(t => t.trim()).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : s;
+  };
+
+  // ---- Procesamiento del blob capturado (doble TTS)
   const processBlob = async (blob: Blob) => {
     setIsRecording(false);
     setIsProcessing(true);
-    setAudioURL("");
+    setAudioURLA("");
+    setAudioURLB("");
 
     try {
       const base = process.env.NEXT_PUBLIC_API_BASE!;
@@ -109,7 +135,7 @@ export default function Home() {
       }
       setText(asrJson.text || "");
 
-      // CHAT (bilingüe natural, sin bullets)
+      // CHAT (bilingüe natural)
       setStatus("Corrigiendo…");
       const fd2 = new FormData();
       fd2.append("prompt", asrJson.text || "");
@@ -123,30 +149,61 @@ export default function Home() {
         setIsProcessing(false);
         return;
       }
-      setReply(chatJson.text || "");
+      const fullCoach = chatJson.text || "";
+      setReply(fullCoach);
 
-      // TTS
-      setStatus("Generando voz…");
-      const fd3 = new FormData();
-      fd3.append("text", chatJson.text || "");
-      fd3.append("voice", "alloy");
-      fd3.append("format", "mp3");
-      const ttsResp = await fetch(`${base}/tts`, { method: "POST", body: fd3 });
-      const tTtsEnd = performance.now();
-      if (!ttsResp.ok) {
-        const j = await ttsResp.json().catch(() => null);
-        setStatus(`TTS ${ttsResp.status}: ${j?.error || "error"}`);
+      // Extrae frase corregida (meta) para shadowing
+      const corrected = extractCorrected(fullCoach);
+
+      // TTS A (explicación completa en nativo) — pace normal
+      setStatus("Generando voz (explicación) …");
+      const fd3a = new FormData();
+      fd3a.append("text", fullCoach);
+      fd3a.append("voice", "alloy");
+      fd3a.append("format", "mp3");
+      fd3a.append("pace", "normal");
+      const ttsAResp = await fetch(`${base}/tts`, { method: "POST", body: fd3a });
+      if (!ttsAResp.ok) {
+        const j = await ttsAResp.json().catch(() => null);
+        setStatus(`TTS-A ${ttsAResp.status}: ${j?.error || "error"}`);
         setIsProcessing(false);
         return;
       }
-      const ab = await ttsResp.arrayBuffer();
-      const url = URL.createObjectURL(new Blob([ab], { type: "audio/mpeg" }));
-      setAudioURL(url);
+      const abA = await ttsAResp.arrayBuffer();
+      const urlA = URL.createObjectURL(new Blob([abA], { type: "audio/mpeg" }));
+      setAudioURLA(urlA);
+
+      // TTS B (solo frase corregida en meta) — pace slow
+      setStatus("Generando voz (shadowing) …");
+      const fd3b = new FormData();
+      fd3b.append("text", corrected);
+      fd3b.append("voice", "alloy");
+      fd3b.append("format", "mp3");
+      fd3b.append("pace", "slow");
+      const ttsBResp = await fetch(`${base}/tts`, { method: "POST", body: fd3b });
+      const tTtsEnd = performance.now();
+      if (!ttsBResp.ok) {
+        const j = await ttsBResp.json().catch(() => null);
+        setStatus(`TTS-B ${ttsBResp.status}: ${j?.error || "error"}`);
+        setIsProcessing(false);
+        return;
+      }
+      const abB = await ttsBResp.arrayBuffer();
+      const urlB = URL.createObjectURL(new Blob([abB], { type: "audio/mpeg" }));
+      setAudioURLB(urlB);
 
       const asrMs = Math.round(tAsrEnd - t0);
       const chatMs = Math.round(tChatEnd - tAsrEnd);
       const ttsMs = Math.round(tTtsEnd - tChatEnd);
       setStatus(`Listo ✅ (ASR ${asrMs}ms, Chat ${chatMs}ms, TTS ${ttsMs}ms)`);
+
+      // Autoplay A → luego B en onEnded
+      setTimeout(() => {
+        if (audioRefA.current && urlA) {
+          audioRefA.current.currentTime = 0;
+          audioRefA.current.play().catch(() => {});
+        }
+      }, 150);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setStatus(`Error: ${msg}`);
@@ -161,9 +218,16 @@ export default function Home() {
     if (!profile) { setStatus("Perfil no cargado"); return; }
 
     setText(""); setReply(""); setStatus("");
+    setAudioURLA(""); setAudioURLB("");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = pickMime();
+      const mimeType = (() => {
+        if (typeof MediaRecorder === "undefined") return undefined;
+        if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) return "audio/webm;codecs=opus";
+        if (MediaRecorder.isTypeSupported("audio/webm")) return "audio/webm";
+        return undefined;
+      })();
+
       const mr = mimeType
         ? new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 64000 })
         : new MediaRecorder(stream);
@@ -184,7 +248,7 @@ export default function Home() {
             return;
           }
           setStatus("Procesando…");
-          await processBlob(blob); // ← procesa de inmediato si detuviste antes de los 15s
+          await processBlob(blob);
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           setStatus(`Error al procesar audio: ${msg}`);
@@ -216,7 +280,7 @@ export default function Home() {
     if (rec.state === "recording") {
       clearAutoStop();
       clearCountdown();
-      rec.stop();                 // ← dispara onstop → processBlob inmediatamente
+      rec.stop();                 // onstop → processBlob inmediatamente
       setStatus("Procesando…");
     }
   };
@@ -277,7 +341,29 @@ export default function Home() {
         <p><b>Coach:</b> {reply}</p>
       </div>
 
-      {audioURL && <audio src={audioURL} controls autoPlay />}
+      {/* Doble TTS */}
+      <div className="space-y-2">
+        {audioURLA && (
+          <div>
+            <div className="text-sm text-gray-700 mb-1">Explicación (nativo)</div>
+            <audio ref={audioRefA} src={audioURLA} controls onEnded={onEndedA} />
+          </div>
+        )}
+        {audioURLB && (
+          <div>
+            <div className="text-sm text-gray-700 mb-1">Frase corregida (shadowing)</div>
+            <audio ref={audioRefB} src={audioURLB} controls />
+            <div className="mt-1">
+              <button
+                onClick={() => { if (audioRefB.current) { audioRefB.current.currentTime = 0; audioRefB.current.play().catch(()=>{}); }}}
+                className="px-2 py-1 text-sm bg-gray-200 rounded"
+              >
+                Repetir shadowing
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
 
       {isProcessing && (
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center">
