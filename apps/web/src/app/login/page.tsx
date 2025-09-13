@@ -1,202 +1,73 @@
 "use client";
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
-import { QRCodeCanvas } from "qrcode.react";
-
-type Step = "login" | "mfa_challenge" | "mfa_enroll";
 
 export default function LoginPage() {
-  const [step, setStep] = useState<Step>("login");
   const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [status, setStatus] = useState("");
+  const [pass, setPass] = useState("");
   const [error, setError] = useState<string | null>(null);
-
-  // enrolamiento/challenge
-  const [enrollId, setEnrollId] = useState<string>("");
-  const [otpUri, setOtpUri] = useState<string>("");
-  const [otpCode, setOtpCode] = useState<string>("");
-  const [verifiedFactorId, setVerifiedFactorId] = useState<string>("");
-  const [challengeId, setChallengeId] = useState<string>("");
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     (async () => {
-      const sessionRes = await supabase.auth.getSession();
-      if (sessionRes.data?.session) window.location.href = "/app";
+      const { data } = await supabase.auth.getSession();
+      if (data.session) {
+        window.location.href = "/";
+      }
     })();
   }, []);
 
-  const handleLogin = async () => {
-    try {
-      setError(null);
-      setStatus("Autenticando…");
-      const signInRes = await supabase.auth.signInWithPassword({ email, password });
-      if (signInRes.error) {
-        if (signInRes.error.message?.toLowerCase().includes("mfa")) {
-          await routeAfterLogin();
-          return;
-        }
-        setError(signInRes.error.message);
-        setStatus("");
-        return;
-      }
-      await routeAfterLogin();
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(msg);
-      setStatus("");
-    }
-  };
-
-  const routeAfterLogin = async () => {
-    setStatus("Comprobando MFA…");
-    const factorsRes = await supabase.auth.mfa.listFactors();
-    if (factorsRes.error) {
-      setError(factorsRes.error.message);
-      setStatus("");
+  const signIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    const { error } = await supabase.auth.signInWithPassword({ email, password: pass });
+    setBusy(false);
+    if (error) {
+      setError(error.message);
       return;
     }
-
-    const totpVerified = factorsRes.data?.all?.find(
-      (f) => f.factor_type === "totp" && f.status === "verified"
-    );
-    if (totpVerified) {
-      setVerifiedFactorId(totpVerified.id);
-      setStep("mfa_challenge");
-      setStatus("");
-      return;
-    }
-
-    // No tiene TOTP -> enrolar
-    const enrollRes = await supabase.auth.mfa.enroll({ factorType: "totp" });
-    if (enrollRes.error) {
-      setError(enrollRes.error.message);
-      setStatus("");
-      return;
-    }
-    setEnrollId(enrollRes.data.id);
-    setOtpUri(enrollRes.data.totp?.uri || "");
-    setStep("mfa_enroll");
-    setStatus("");
-  };
-
-  // Verifica el enrolamiento creando primero un challenge y luego verificándolo
-  const verifyEnrollment = async () => {
-    setStatus("Creando desafío…");
-    const ch = await supabase.auth.mfa.challenge({ factorId: enrollId });
-    if (ch.error) { setError(ch.error.message); setStatus(""); return; }
-
-    setStatus("Verificando TOTP…");
-    const verifyRes = await supabase.auth.mfa.verify({
-      factorId: enrollId,
-      challengeId: ch.data.id,
-      code: otpCode,
-    });
-    if (verifyRes.error) {
-      setError(verifyRes.error.message);
-    } else {
-      window.location.href = "/app";
-    }
-    setStatus("");
-  };
-
-  const startChallenge = async () => {
-    setStatus("Creando desafío MFA…");
-    const ch = await supabase.auth.mfa.challenge({ factorId: verifiedFactorId });
-    if (ch.error) { setError(ch.error.message); setStatus(""); return; }
-    setChallengeId(ch.data.id);
-    setStatus("");
-  };
-
-  const verifyChallenge = async () => {
-    setStatus("Verificando código…");
-    const verifyRes = await supabase.auth.mfa.verify({
-      factorId: verifiedFactorId,
-      challengeId,
-      code: otpCode,
-    });
-    if (verifyRes.error) {
-      setError(verifyRes.error.message);
-    } else {
-      window.location.href = "/app";
-    }
-    setStatus("");
+    window.location.href = "/";
   };
 
   return (
-    <main className="p-6 max-w-md mx-auto space-y-6">
-      <h1 className="text-2xl font-bold">Acceso</h1>
-      {status && <p className="text-sm text-gray-600">{status}</p>}
-      {error && <p className="text-sm text-red-600">{error}</p>}
+    <main className="p-6 max-w-sm mx-auto space-y-4">
+      <h1 className="text-2xl font-bold">Entrar</h1>
+      <p className="text-sm text-gray-600">Usa tu correo y contraseña.</p>
 
-      {step === "login" && (
-        <div className="space-y-3">
+      {error && <div className="text-sm text-red-600">{error}</div>}
+
+      <form onSubmit={signIn} className="space-y-3">
+        <div>
+          <label className="block text-sm mb-1">Email</label>
           <input
+            type="email"
+            required
             className="w-full border rounded px-3 py-2"
-            placeholder="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            type="email"
+            placeholder="tu@correo.com"
           />
+        </div>
+        <div>
+          <label className="block text-sm mb-1">Contraseña</label>
           <input
-            className="w-full border rounded px-3 py-2"
-            placeholder="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
             type="password"
-          />
-          <button onClick={handleLogin} className="px-3 py-2 bg-black text-white rounded">
-            Entrar
-          </button>
-        </div>
-      )}
-
-      {step === "mfa_enroll" && (
-        <div className="space-y-3">
-          <p className="text-sm">
-            Escanea este QR con Google Authenticator / Authy y luego introduce el código de 6 dígitos.
-          </p>
-          {otpUri && (
-            <div className="border rounded p-3 inline-block">
-              <QRCodeCanvas value={otpUri} size={180} includeMargin />
-            </div>
-          )}
-          <input
+            required
             className="w-full border rounded px-3 py-2"
-            placeholder="Código 6 dígitos"
-            value={otpCode}
-            onChange={(e) => setOtpCode(e.target.value)}
-            inputMode="numeric"
+            value={pass}
+            onChange={(e) => setPass(e.target.value)}
+            placeholder="••••••••"
           />
-          <button onClick={verifyEnrollment} className="px-3 py-2 bg-black text-white rounded">
-            Verificar y entrar
-          </button>
         </div>
-      )}
-
-      {step === "mfa_challenge" && (
-        <div className="space-y-3">
-          <p className="text-sm">Introduce tu código TOTP.</p>
-          {!challengeId ? (
-            <button onClick={startChallenge} className="px-3 py-2 bg-gray-200 rounded">
-              Generar desafío
-            </button>
-          ) : (
-            <>
-              <input
-                className="w-full border rounded px-3 py-2"
-                placeholder="Código 6 dígitos"
-                value={otpCode}
-                onChange={(e) => setOtpCode(e.target.value)}
-                inputMode="numeric"
-              />
-              <button onClick={verifyChallenge} className="px-3 py-2 bg-black text-white rounded">
-                Verificar y entrar
-              </button>
-            </>
-          )}
-        </div>
-      )}
+        <button
+          type="submit"
+          disabled={busy}
+          className={`w-full px-3 py-2 rounded text-white ${busy ? "bg-gray-400" : "bg-black"}`}
+        >
+          {busy ? "Entrando…" : "Entrar"}
+        </button>
+      </form>
     </main>
   );
 }
