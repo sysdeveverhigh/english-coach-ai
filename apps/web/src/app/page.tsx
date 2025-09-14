@@ -12,52 +12,51 @@ type Profile = {
 };
 
 export default function Home() {
-  // Estados de captura
   const [rec, setRec] = useState<MediaRecorder | null>(null);
   const chunks = useRef<BlobPart[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
 
-  // UI/estado
   const [status, setStatus] = useState("");
   const [text, setText] = useState("");
   const [reply, setReply] = useState("");
 
-  // Doble TTS
-  const [audioURLA, setAudioURLA] = useState<string>(""); // Explicación (nativo)
-  const [audioURLB, setAudioURLB] = useState<string>(""); // Frase corregida (meta, lento)
+  const [audioURLA, setAudioURLA] = useState<string>("");
+  const [audioURLB, setAudioURLB] = useState<string>("");
   const audioRefA = useRef<HTMLAudioElement | null>(null);
   const audioRefB = useRef<HTMLAudioElement | null>(null);
 
-  // Timer
   const [timerLeft, setTimerLeft] = useState<number>(MAX_MS / 1000);
   const timerRef = useRef<number | null>(null);
   const stopTimeoutRef = useRef<number | null>(null);
 
-  // Perfil
   const [profile, setProfile] = useState<Profile | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
 
-  // Precalienta API + asegura perfil
   useEffect(() => {
     (async () => {
       const base = process.env.NEXT_PUBLIC_API_BASE!;
       fetch(`${base}/health`).catch(() => {});
       const { data: sessionData } = await supabase.auth.getSession();
       const session = sessionData.session;
-      if (!session) { window.location.href = "/login"; return; }
+      if (!session) {
+        window.location.href = "/login";
+        return;
+      }
       setUserEmail(session.user.email ?? null);
       const { data: p } = await supabase
         .from("profiles")
         .select("*")
         .eq("user_id", session.user.id)
         .maybeSingle();
-      if (!p) { window.location.href = "/profile"; return; }
+      if (!p) {
+        window.location.href = "/profile";
+        return;
+      }
       setProfile(p as Profile);
     })();
   }, []);
 
-  // Cuando termina el audio A, autoinicia el B
   const onEndedA = () => {
     if (audioRefB.current && audioURLB) {
       audioRefB.current.currentTime = 0;
@@ -65,19 +64,11 @@ export default function Home() {
     }
   };
 
-  const pickMime = () => {
-    if (typeof MediaRecorder === "undefined") return undefined;
-    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) return "audio/webm;codecs=opus";
-    if (MediaRecorder.isTypeSupported("audio/webm")) return "audio/webm";
-    return undefined;
-  };
-
-  // ---- Countdown helpers
   const startCountdown = () => {
     setTimerLeft(Math.round(MAX_MS / 1000));
-    clearCountdown();
+    if (timerRef.current) clearInterval(timerRef.current);
     timerRef.current = window.setInterval(() => {
-      setTimerLeft(s => (s > 0 ? s - 1 : 0));
+      setTimerLeft((s) => (s > 0 ? s - 1 : 0));
     }, 1000);
   };
 
@@ -95,19 +86,15 @@ export default function Home() {
     }
   };
 
-  // ---- Util: extraer frase corregida entre comillas
   const extractCorrected = (s: string): string => {
     const m = s.match(/"([^"]+)"/);
     if (m && m[1]) return m[1];
-    // fallback: intenta comillas simples
     const m2 = s.match(/'([^']+)'/);
     if (m2 && m2[1]) return m2[1];
-    // si no hay comillas, usa la última oración del texto
-    const parts = s.split(/[\.\!\?]/).map(t => t.trim()).filter(Boolean);
+    const parts = s.split(/[\.\!\?]/).map((t) => t.trim()).filter(Boolean);
     return parts.length ? parts[parts.length - 1] : s;
   };
 
-  // ---- Procesamiento del blob capturado (doble TTS)
   const processBlob = async (blob: Blob) => {
     setIsRecording(false);
     setIsProcessing(true);
@@ -135,7 +122,7 @@ export default function Home() {
       }
       setText(asrJson.text || "");
 
-      // CHAT (bilingüe natural)
+      // CHAT
       setStatus("Corrigiendo…");
       const fd2 = new FormData();
       fd2.append("prompt", asrJson.text || "");
@@ -151,11 +138,9 @@ export default function Home() {
       }
       const fullCoach = chatJson.text || "";
       setReply(fullCoach);
-
-      // Extrae frase corregida (meta) para shadowing
       const corrected = extractCorrected(fullCoach);
 
-      // TTS A (explicación completa en nativo) — pace normal
+      // TTS A
       setStatus("Generando voz (explicación) …");
       const fd3a = new FormData();
       fd3a.append("text", fullCoach);
@@ -173,7 +158,7 @@ export default function Home() {
       const urlA = URL.createObjectURL(new Blob([abA], { type: "audio/mpeg" }));
       setAudioURLA(urlA);
 
-      // TTS B (solo frase corregida en meta) — pace slow
+      // TTS B
       setStatus("Generando voz (shadowing) …");
       const fd3b = new FormData();
       fd3b.append("text", corrected);
@@ -197,7 +182,6 @@ export default function Home() {
       const ttsMs = Math.round(tTtsEnd - tChatEnd);
       setStatus(`Listo ✅ (ASR ${asrMs}ms, Chat ${chatMs}ms, TTS ${ttsMs}ms)`);
 
-      // Autoplay A → luego B en onEnded
       setTimeout(() => {
         if (audioRefA.current && urlA) {
           audioRefA.current.currentTime = 0;
@@ -212,13 +196,18 @@ export default function Home() {
     }
   };
 
-  // ---- Start
   const startRec = async () => {
     if (isRecording || isProcessing) return;
-    if (!profile) { setStatus("Perfil no cargado"); return; }
+    if (!profile) {
+      setStatus("Perfil no cargado");
+      return;
+    }
 
-    setText(""); setReply(""); setStatus("");
-    setAudioURLA(""); setAudioURLB("");
+    setText("");
+    setReply("");
+    setStatus("");
+    setAudioURLA("");
+    setAudioURLB("");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mimeType = (() => {
@@ -233,7 +222,9 @@ export default function Home() {
         : new MediaRecorder(stream);
 
       chunks.current = [];
-      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.current.push(e.data); };
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.current.push(e.data);
+      };
 
       mr.onstop = async () => {
         clearCountdown();
@@ -259,11 +250,10 @@ export default function Home() {
       mr.start(250);
       setRec(mr);
       setIsRecording(true);
-      setStatus(`Grabando… (máximo ${Math.round(MAX_MS/1000)}s)`);
+      setStatus(`Grabando… (máximo ${Math.round(MAX_MS / 1000)}s)`);
       setTimerLeft(Math.round(MAX_MS / 1000));
       startCountdown();
 
-      // Auto-stop a los 15s (si el usuario no detiene antes)
       stopTimeoutRef.current = window.setTimeout(() => {
         if (mr.state === "recording") mr.stop();
       }, MAX_MS);
@@ -274,13 +264,12 @@ export default function Home() {
     }
   };
 
-  // ---- Stop manual (antes de 15s)
   const stopRec = () => {
     if (!rec) return;
     if (rec.state === "recording") {
       clearAutoStop();
       clearCountdown();
-      rec.stop();                 // onstop → processBlob inmediatamente
+      rec.stop();
       setStatus("Procesando…");
     }
   };
@@ -297,18 +286,16 @@ export default function Home() {
           <span className="text-sm text-gray-600">
             {userEmail} | {profile.native_lang}→{profile.target_lang}
           </span>
-	  <button
-		  onClick={()=> (window.location.href="/lesson/restaurant")}
-                  className="px-3 py-2 bg-gray-200 rounded">
-            Iniciar lección: Restaurante
-          </button>
-          <button onClick={() => (window.location.href = "/profile")}
-                  className="px-3 py-2 bg-gray-200 rounded">
+          <button onClick={() => (window.location.href = "/profile")} className="px-3 py-2 bg-gray-200 rounded">
             Perfil
           </button>
           <button
-            onClick={async () => { await supabase.auth.signOut(); window.location.href = "/login"; }}
-            className="px-3 py-2 bg-gray-200 rounded">
+            onClick={async () => {
+              await supabase.auth.signOut();
+              window.location.href = "/login";
+            }}
+            className="px-3 py-2 bg-gray-200 rounded"
+          >
             Cerrar sesión
           </button>
         </div>
@@ -317,7 +304,10 @@ export default function Home() {
       <div className="text-sm text-gray-700">
         <b>Nota:</b> el turno se corta a los <b>15s</b> máximo. Puedes detener antes.
         {isRecording && (
-          <> Tiempo restante: <span className="font-mono">{timerLeft}s</span></>
+          <>
+            {" "}
+            Tiempo restante: <span className="font-mono">{timerLeft}s</span>
+          </>
         )}
       </div>
 
@@ -325,27 +315,32 @@ export default function Home() {
         <button
           onClick={startRec}
           disabled={isRecording || isProcessing}
-          className={`px-3 py-2 rounded text-white ${(isRecording || isProcessing) ? "bg-gray-400" : "bg-black"}`}
+          className={`px-3 py-2 rounded text-white ${isRecording || isProcessing ? "bg-gray-400" : "bg-black"}`}
         >
           Grabar
         </button>
+        <button onClick={stopRec} disabled={!isRecording} className="px-3 py-2 bg-gray-200 rounded">
+          Detener
+        </button>
         <button
-          onClick={stopRec}
-          disabled={!isRecording}
+          onClick={() => (window.location.href = "/lesson/restaurant")}
           className="px-3 py-2 bg-gray-200 rounded"
         >
-          Detener
+          Iniciar lección: Restaurante
         </button>
       </div>
 
       <p className="text-sm text-gray-600">{status}</p>
 
       <div className="space-y-2">
-        <p><b>Tú dijiste:</b> {text}</p>
-        <p><b>Coach:</b> {reply}</p>
+        <p>
+          <b>Tú dijiste:</b> {text}
+        </p>
+        <p>
+          <b>Coach:</b> {reply}
+        </p>
       </div>
 
-      {/* Doble TTS */}
       <div className="space-y-2">
         {audioURLA && (
           <div>
@@ -359,7 +354,12 @@ export default function Home() {
             <audio ref={audioRefB} src={audioURLB} controls />
             <div className="mt-1">
               <button
-                onClick={() => { if (audioRefB.current) { audioRefB.current.currentTime = 0; audioRefB.current.play().catch(()=>{}); }}}
+                onClick={() => {
+                  if (audioRefB.current) {
+                    audioRefB.current.currentTime = 0;
+                    audioRefB.current.play().catch(() => {});
+                  }
+                }}
                 className="px-2 py-1 text-sm bg-gray-200 rounded"
               >
                 Repetir shadowing
