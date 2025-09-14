@@ -297,14 +297,18 @@ export default function Home() {
           <span className="text-sm text-gray-600">
             {userEmail} | {profile.native_lang}→{profile.target_lang}
           </span>
+	  <button
+		  onClick={()=> (window.location.href="/lesson/restaurant")}
+                  className="px-3 py-2 bg-gray-200 rounded">
+            Iniciar lección: Restaurante
+          </button>
           <button onClick={() => (window.location.href = "/profile")}
                   className="px-3 py-2 bg-gray-200 rounded">
             Perfil
           </button>
           <button
             onClick={async () => { await supabase.auth.signOut(); window.location.href = "/login"; }}
-            className="px-3 py-2 bg-gray-200 rounded"
-          >
+            className="px-3 py-2 bg-gray-200 rounded">
             Cerrar sesión
           </button>
         </div>
