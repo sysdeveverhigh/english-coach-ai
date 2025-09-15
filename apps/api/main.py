@@ -1,6 +1,6 @@
 # apps/api/main.py
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from uuid import UUID, uuid4
@@ -103,7 +103,7 @@ def envcheck():
 @app.get("/keepalive")
 def keepalive():
     # 204 No Content => sin body
-    return JSONResponse(status_code=204, content=None)
+    return JSONResponse(status_code=204)
 
 # ---- ASR (Whisper) ----
 @app.post("/asr")
