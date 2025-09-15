@@ -99,6 +99,12 @@ def envcheck():
         "SUPABASE_SERVICE_ROLE_set": bool(SUPABASE_SERVICE_ROLE),
     }
 
+# ping baratísimo: no toca DB ni OpenAI
+@app.get("/keepalive")
+def keepalive():
+    # 204 No Content => sin body
+    return JSONResponse(status_code=204, content=None)
+
 # ---- ASR (Whisper) ----
 @app.post("/asr")
 async def asr(audio: UploadFile = File(...), language: str = Form("en")):
