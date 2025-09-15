@@ -3,20 +3,32 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from uuid import UUID, uuid4
 import httpx, os, json
 import re
 from typing import Dict, Any
 
 # ---- CONFIG ----
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE = os.getenv("OPENAI_BASE", "https://api.openai.com/v1")
+CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 APP_ENV = os.getenv("APP_ENV", "prod")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE = os.getenv("SUPABASE_SERVICE_ROLE", "")  # crea esta variable en Render
+# <- lee cualquiera de los dos nombres que tienes en Render
+SUPABASE_SERVICE_ROLE = (
+    os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE") or ""
+) # crea estas variables en Render
+
 supabase_headers = {
     "apikey": SUPABASE_SERVICE_ROLE,
     "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE}",
     "Content-Type": "application/json",
+    "Prefer": "return=representation",
 }
+
+def json_error(name: str, detail: str, code: int = 500):
+    return JSONResponse({"error": name, "detail": detail}, status_code=code)
+
 
 # Cliente HTTP global (keep-alive) para reducir latencia TLS/handshake
 http_client = httpx.AsyncClient(
@@ -77,11 +89,15 @@ RESTAURANT_STEPS = [
 # ---- HEALTH / ENVCHECK ----
 @app.get("/health")
 def health():
-    return {"ok": True, "env": APP_ENV}
+    return {"ok": True, "env": os.getenv("APP_ENV", "prod")}
 
 @app.get("/envcheck")
 def envcheck():
-    return {"ok": True, "has_openai": bool(OPENAI_API_KEY), "openai_len": len(OPENAI_API_KEY or "")}
+    return {
+        "OPENAI_API_KEY_set": bool(OPENAI_API_KEY),
+        "SUPABASE_URL_set": bool(SUPABASE_URL),
+        "SUPABASE_SERVICE_ROLE_set": bool(SUPABASE_SERVICE_ROLE),
+    }
 
 # ---- ASR (Whisper) ----
 @app.post("/asr")
@@ -242,175 +258,178 @@ def lesson_coach_prompt(native: str, target: str, step_goal: str, expect_keyword
         f"Context:\nNATIVE={native}; TARGET={target}; STEP_GOAL={step_goal}; EXPECT_KEYWORDS={expect_keywords}.\n"
         "Be strict but kind. If key info is missing, set need_repeat=true.\n"
     )
+
 @app.post("/lesson/start")
 async def lesson_start(
-    user_id: str = Form(...),
-    native_language: str = Form("es"),
-    target_language: str = Form("en"),
-    topic: str = Form("restaurant"),
-    student_name: str = Form(""),
+    user_id: UUID = Form(...),
+    native_language: str = Form(...),
+    target_language: str = Form(...),
+    topic: str = Form(...),
+    student_name: str = Form("")
 ):
-    if topic != "restaurant":
-        return JSONResponse({"error": "unsupported_topic"}, status_code=400)
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE):
+        return json_error("server_misconfig", "Supabase URL or Service Role missing", 500)
 
-    # crear sesión
-    sess_payload = {
-        "user_id": user_id,
-        "topic": topic,
-        "native_lang": native_language,
-        "target_lang": target_language,
-        "step_index": 0,
-        "status": "active",
-    }
-    async with httpx.AsyncClient() as c:
-        r = await c.post(f"{SUPABASE_URL}/rest/v1/lesson_sessions", headers=supabase_headers, json=sess_payload)
-        if r.status_code not in (200,201):
-            return JSONResponse({"error":"supabase_create_session_failed","detail":r.text}, status_code=500)
-        sess = r.json()[0] if isinstance(r.json(), list) else r.json()
+    # 1) Crea la sesión en Supabase
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/lesson_sessions",
+                headers=supabase_headers,
+                json={
+                    "user_id": str(user_id),
+                    "topic": topic,
+                    "native_lang": native_language,
+                    "target_lang": target_language,
+                    "step_index": 0,
+                },
+            )
+        print("SUPABASE START status:", resp.status_code, "body:", resp.text[:400])
+        if resp.status_code not in (200, 201):
+            return json_error("supabase_create_session_failed", resp.text, 500)
+        row = resp.json()[0]
+        lesson_id = row["id"]
+    except Exception as e:
+        print("SUPABASE START EXC:", repr(e))
+        return json_error("supabase_exception", str(e), 500)
 
-    step = RESTAURANT_STEPS[0]
-    teacher_text_native = step["teacher_native"].format(name=student_name or "allumno")
+    # 2) Pedir intro al LLM (opcional; si falla, devolvemos vacío)
+    intro = ""
+    if OPENAI_API_KEY:
+        system = (
+            "Eres una profesora amable. Da una breve consigna en el idioma NATIVO del alumno, "
+            "presenta el tema y termina con UNA pregunta para iniciar conversación. "
+            "Nada de bullets ni números."
+        )
+        user = (
+            f"Idioma nativo: {native_language}. Idioma meta: {target_language}. "
+            f"Tema: {topic}. Alumno: {student_name or 'estudiante'}. "
+            "Produce 1–2 frases naturales en el idioma nativo, cerrando con una pregunta simple."
+        )
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(
+                    f"{OPENAI_BASE}/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    json={
+                        "model": CHAT_MODEL,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ],
+                        "temperature": 0.6,
+                    },
+                )
+            print("LLM START status:", r.status_code, "body:", r.text[:400])
+            if r.status_code == 200:
+                j = r.json()
+                intro = j["choices"][0]["message"]["content"].strip()
+            else:
+                # no bloquees el flujo si el LLM falla
+                pass
+        except Exception as e:
+            print("LLM START EXC:", repr(e))
+            # intro se queda ""
 
     return {
-        "lesson_id": sess["id"],
+        "lesson_id": lesson_id,
         "step_index": 0,
-        "teacher_text_native": teacher_text_native,
-        "goal": step["goal"]
+        "teacher_text_native": intro,
     }
+
 
 @app.post("/lesson/turn")
 async def lesson_turn(
-    lesson_id: str = Form(...),
+    lesson_id: UUID = Form(...),
     step_index: int = Form(...),
     user_text: str = Form(...),
-    native_language: str = Form("es"),
-    target_language: str = Form("en"),
+    native_language: str = Form(...),
+    target_language: str = Form(...),
 ):
-    step = next((s for s in RESTAURANT_STEPS if s["id"] == step_index), None)
-    if not step:
-        return JSONResponse({"error":"invalid_step"}, status_code=400)
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE):
+        return json_error("server_misconfig", "Supabase URL or Service Role missing", 500)
 
-    system = lesson_coach_prompt(native_language, target_language, step["goal"], step["expect_keywords"])
-    body = {
-        "model": "gpt-4o-mini",
-        "temperature": 0.4,
-        "messages": [
-            {"role":"system","content": system},
-            {"role":"user", "content": f"STUDENT_UTTERANCE (TARGET): {user_text}"}
-        ]
-    }
+    teacher_feedback = ""
+    corrected_sentence = ""
 
-    r = await http_client.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"},
-        json=body
-    )
-    if r.status_code != 200:
-        return JSONResponse({"error":"openai_chat_failed","detail":r.text}, status_code=500)
+    # 1) LLM feedback JSON
+    if OPENAI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(
+                    f"{OPENAI_BASE}/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    json={
+                        "model": CHAT_MODEL,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Eres una profesora de idiomas. Devuelve JSON con dos campos: "
+                                    '{"teacher_feedback": <texto en idioma nativo del alumno>, '
+                                    '"corrected_sentence": <una sola oración corregida en el idioma meta>}. '
+                                    "Feedback cálido, 1–2 frases, sin listas."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": f'Idioma nativo="{native_language}", meta="{target_language}". Alumno dijo: "{user_text}".'
+                            },
+                        ],
+                        "temperature": 0.5,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+            print("LLM TURN status:", r.status_code, "body:", r.text[:400])
+            if r.status_code == 200:
+                payload = r.json()["choices"][0]["message"]["content"]
+                data = json.loads(payload)
+                teacher_feedback = data.get("teacher_feedback", "")
+                corrected_sentence = data.get("corrected_sentence", "")
+        except Exception as e:
+            print("LLM TURN EXC:", repr(e))
 
-    raw = r.json()["choices"][0]["message"]["content"]
-
-    # Tolerancia a formato: intenta parsear JSON
+    # 2) Guardar turno en Supabase
     try:
-        j = json.loads(raw)
-    except Exception:
-        # fallback: extrae con heurística mínima
-        j = {
-            "teacher_feedback": raw,
-            "corrected_sentence": "",
-            "score": 0.5,
-            "need_repeat": True
-        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            ins = await client.post(
+                f"{SUPABASE_URL}/rest/v1/lesson_turns",
+                headers=supabase_headers,
+                json={
+                    "lesson_id": str(lesson_id),
+                    "step_index": step_index,
+                    "user_text": user_text,
+                    "teacher_feedback": teacher_feedback,
+                    "corrected_sentence": corrected_sentence,
+                    "score": 0.0,
+                    "need_repeat": True,
+                },
+            )
+        print("SUPABASE TURN status:", ins.status_code, "body:", ins.text[:400])
+        if ins.status_code not in (200, 201):
+            return json_error("supabase_insert_turn_failed", ins.text, 500)
+    except Exception as e:
+        print("SUPABASE TURN EXC:", repr(e))
+        return json_error("supabase_exception", str(e), 500)
 
-    teacher_feedback = j.get("teacher_feedback","").strip()
-    corrected = j.get("corrected_sentence","").strip().strip('"')
-    score = float(j.get("score",0.5))
-    need_repeat = bool(j.get("need_repeat", True))
+    advanced = len(user_text.split()) >= 6
+    next_step_index = step_index + 1 if advanced else step_index
+    next_teacher_text_native = (
+        "Excelente. Ahora intenta pedir la bebida con una frase completa y cortés."
+        if advanced and native_language.startswith("es") else
+        "Great. Now try to order a drink using a complete and polite sentence." if advanced else ""
+    )
 
-    # registrar turno
-    turn_payload = {
-        "lesson_id": lesson_id,
-        "step_index": step_index,
-        "user_text": user_text,
-        "teacher_feedback": teacher_feedback,
-        "corrected_sentence": corrected,
-        "score": score,
-        "need_repeat": need_repeat
-    }
-    async with httpx.AsyncClient() as c:
-        r2 = await c.post(f"{SUPABASE_URL}/rest/v1/lesson_turns", headers=supabase_headers, json=turn_payload)
-        if r2.status_code not in (200,201):
-            return JSONResponse({"error":"supabase_insert_turn_failed","detail":r2.text}, status_code=500)
-
-        # actualizar sesión: avg y conteo
-        # Nota: calculamos incrementalmente en SQL simple
-        upd = await c.patch(
-            f"{SUPABASE_URL}/rest/v1/lesson_sessions?id=eq.{lesson_id}",
-            headers=supabase_headers,
-            json={"turns_count": "turns_count+1", "avg_score": "avg_score"}  # dummy; haremos SELECT para calcular
-        )
-
-        # recalcular avg en app (simple): lee últimos 30 turnos
-        q = await c.get(
-            f"{SUPABASE_URL}/rest/v1/lesson_turns?lesson_id=eq.{lesson_id}&select=score&order=created_at.desc&limit=30",
-            headers=supabase_headers
-        )
-        scores = [float(x.get("score",0)) for x in q.json()] if q.status_code==200 else []
-        avg = round(sum(scores)/len(scores), 3) if scores else 0.0
-        await c.patch(
-            f"{SUPABASE_URL}/rest/v1/lesson_sessions?id=eq.{lesson_id}",
-            headers=supabase_headers,
-            json={"avg_score": avg}
-        )
-
-    # avanzar o repetir
-    if not need_repeat:
-        next_idx = step_index + 1
-        # si hay siguiente paso, actualiza step_index
-        if next_idx < len(RESTAURANT_STEPS):
-            async with httpx.AsyncClient() as c:
-                await c.patch(
-                    f"{SUPABASE_URL}/rest/v1/lesson_sessions?id=eq.{lesson_id}",
-                    headers=supabase_headers,
-                    json={"step_index": next_idx}
-                )
-            next_step = RESTAURANT_STEPS[next_idx]
-            return {
-                "teacher_feedback": teacher_feedback,
-                "corrected_sentence": corrected,
-                "score": score,
-                "need_repeat": False,
-                "advanced": True,
-                "next_step_index": next_idx,
-                "next_teacher_text_native": next_step["teacher_native"]
-            }
-        else:
-            # última etapa: marcar como completed si avg >= 0.75
-            status = "completed" if avg >= 0.75 else "active"
-            async with httpx.AsyncClient() as c:
-                await c.patch(
-                    f"{SUPABASE_URL}/rest/v1/lesson_sessions?id=eq.{lesson_id}",
-                    headers=supabase_headers,
-                    json={"status": status}
-                )
-            return {
-                "teacher_feedback": teacher_feedback,
-                "corrected_sentence": corrected,
-                "score": score,
-                "need_repeat": False,
-                "advanced": False,
-                "lesson_done": (status=="completed"),
-                "avg_score": avg
-            }
-
-    # repetir
     return {
         "teacher_feedback": teacher_feedback,
-        "corrected_sentence": corrected,
-        "score": score,
-        "need_repeat": True,
-        "advanced": False
+        "corrected_sentence": corrected_sentence,
+        "advanced": advanced,
+        "lesson_done": False,
+        "next_step_index": next_step_index,
+        "next_teacher_text_native": next_teacher_text_native,
     }
+
+
 
 @app.post("/lesson/finish")
 async def lesson_finish(lesson_id: str = Form(...)):
