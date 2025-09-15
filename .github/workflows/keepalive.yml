@@ -1,0 +1,22 @@
+name: keepalive
+
+on:
+  schedule:
+    - cron: "*/12 * * * *"   # cada 15 minutos (aún más barato)
+  workflow_dispatch: {}       # lanzable a mano
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render ultra-light
+        run: |
+          curl -fsS -A "KeepaliveBot/1.0" https://english-coach-ai.onrender.com/keepalive || true
+
+      - name: Ping /health (diagnóstico barato)
+        run: |
+          curl -fsS -A "KeepaliveBot/1.0" https://english-coach-ai.onrender.com/health || true
+
+      - name: Ping frontend Vercel (opcional)
+        run: |
+          curl -fsS -A "KeepaliveBot/1.0" https://coach.everhighit.com/ || true
