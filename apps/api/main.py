@@ -108,9 +108,9 @@ async def tts(text: str = Form(...), language: str = Form("en")):
     # Selección de voz por idioma
     lang = (language or "").lower()
     if lang.startswith("en"):
-        voice = "aria"   # recomendada para inglés (cálida, estilo profesora)
+        voice = "verse"   # recomendada para inglés (cálida, estilo profesora)
     elif lang.startswith("es"):
-        voice = "lumen"  # recomendada para español (clara y natural)
+        voice = "sage"  # recomendada para español (clara y natural)
     else:
         voice = "alloy"  # fallback neutral
 
