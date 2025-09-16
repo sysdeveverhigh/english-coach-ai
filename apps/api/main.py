@@ -97,22 +97,38 @@ async def asr(audio: UploadFile = File(...), language: str = Form("en")):
         print("ASR EXCEPTION", repr(e))
         return json_error("server_exception", str(e), 500)
 
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# TTS (Aria para EN, Lumen para ES)  ← NUEVO
+# TTS (voz seleccionable por usuario — con validación)
 # ──────────────────────────────────────────────────────────────────────────────
+ALLOWED_VOICES = {
+    "alloy", "echo", "fable", "onyx", "nova", "shimmer",
+    "coral", "verse", "ballad", "ash", "sage", "marin", "cedar"
+}
+
+def pick_default_voice_by_lang(lang: str) -> str:
+    lang = (lang or "").lower()
+    if lang.startswith("en"):
+        return "verse"   # default inglés
+    if lang.startswith("es"):
+        return "sage"    # default español
+    return "alloy"       # fallback neutral
+
 @app.post("/tts")
-async def tts(text: str = Form(...), language: str = Form("en")):
+async def tts(
+    text: str = Form(...),
+    language: str = Form("en"),
+    voice: str = Form(None)  # ← nuevo: opcional
+):
     if not OPENAI_API_KEY:
         return json_error("server_misconfig", "OPENAI_API_KEY is empty", 500)
 
-    # Selección de voz por idioma
-    lang = (language or "").lower()
-    if lang.startswith("en"):
-        voice = "verse"   # recomendada para inglés (cálida, estilo profesora)
-    elif lang.startswith("es"):
-        voice = "sage"  # recomendada para español (clara y natural)
-    else:
-        voice = "alloy"  # fallback neutral
+    v = (voice or "").strip().lower()
+    if v and v not in ALLOWED_VOICES:
+        return json_error("invalid_voice", f"Unsupported voice '{v}'", 400)
+    if not v:
+        v = pick_default_voice_by_lang(language)
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -121,7 +137,7 @@ async def tts(text: str = Form(...), language: str = Form("en")):
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
                 json={
                     "model": "gpt-4o-mini-tts",
-                    "voice": voice,
+                    "voice": v,
                     "input": text,
                 },
             )
@@ -129,7 +145,6 @@ async def tts(text: str = Form(...), language: str = Form("en")):
             print("TTS ERROR", r.status_code, r.text[:500])
             return json_error("openai_tts_failed", r.text, 500)
 
-        # audio/mpeg (mp3)
         return Response(r.content, media_type="audio/mpeg")
     except Exception as e:
         print("TTS EXCEPTION", repr(e))
