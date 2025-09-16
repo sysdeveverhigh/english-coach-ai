@@ -1,23 +1,41 @@
 # apps/api/main.py
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, Form, Response
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
+import os, json
 from uuid import UUID, uuid4
-import httpx, os, json
-import re
-from typing import Dict, Any
 
-# ---- CONFIG ----
+import httpx
+from fastapi import FastAPI, UploadFile, File, Form, Response
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+# ──────────────────────────────────────────────────────────────────────────────
+# App & CORS
+# ──────────────────────────────────────────────────────────────────────────────
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://coach.everhighit.com",
+        "https://english-coach-ai.onrender.com",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Env & Config
+# ──────────────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE = os.getenv("OPENAI_BASE", "https://api.openai.com/v1")
-CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-APP_ENV = os.getenv("APP_ENV", "prod")
+CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")  # LLM para texto
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-# <- lee cualquiera de los dos nombres que tienes en Render
+# acepta cualquiera de los dos nombres que pudiste configurar en Render
 SUPABASE_SERVICE_ROLE = (
     os.getenv("SUPABASE_SERVICE_ROLE") or os.getenv("SUPABASE_SERVICE") or ""
-) # crea estas variables en Render
+)
 
 supabase_headers = {
     "apikey": SUPABASE_SERVICE_ROLE,
@@ -29,64 +47,9 @@ supabase_headers = {
 def json_error(name: str, detail: str, code: int = 500):
     return JSONResponse({"error": name, "detail": detail}, status_code=code)
 
-
-# Cliente HTTP global (keep-alive) para reducir latencia TLS/handshake
-http_client = httpx.AsyncClient(
-    timeout=120.0,
-    limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
-)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # aquí podrías "precalentar" si quisieras
-    yield
-    await http_client.aclose()
-
-app = FastAPI(lifespan=lifespan)
-
-# CORS: preview de Vercel + prod + local
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://english-coach-ai.onrender.com",  # pruebas directas API
-        "https://coach.everhighit.com",           # prod web
-        "http://localhost:3000",                  # local
-    ],
-    allow_origin_regex=r"^https://.*\.vercel\.app$",  # previews de Vercel
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-# CONVERSACIONES
-RESTAURANT_STEPS = [
-    {
-        "id": 0,
-        "goal": "Saludar y pedir mesa",
-        "teacher_native": "Hola {name}, hoy practicaremos cómo pedir en un restaurante. Imagina que llegas y quieres una mesa. Dime: “Buenas tardes, ¿tienen una mesa para [número de personas]?”",
-        "expect_keywords": ["mesa", "personas", "buenas", "tardes"]
-    },
-    {
-        "id": 1,
-        "goal": "Pedir bebida",
-        "teacher_native": "Perfecto. Ahora pide una bebida. Por ejemplo, “Me gustaría un agua sin gas, por favor” o “¿Tienen jugos naturales?”. Adelante.",
-        "expect_keywords": ["agua", "jugo", "bebida", "por favor"]
-    },
-    {
-        "id": 2,
-        "goal": "Pedir plato principal y una recomendación",
-        "teacher_native": "Muy bien. Ahora pide el plato principal y pregunta por una recomendación del chef. Inténtalo.",
-        "expect_keywords": ["plato", "recomendación", "chef", "principal"]
-    },
-    {
-        "id": 3,
-        "goal": "Pedir la cuenta",
-        "teacher_native": "Genial. Para terminar, pide la cuenta de forma cortés. Adelante.",
-        "expect_keywords": ["cuenta", "por favor", "gracias"]
-    }
-]
-
-
-# ---- HEALTH / ENVCHECK ----
+# ──────────────────────────────────────────────────────────────────────────────
+# Health / Keepalive
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True, "env": os.getenv("APP_ENV", "prod")}
@@ -99,17 +62,18 @@ def envcheck():
         "SUPABASE_SERVICE_ROLE_set": bool(SUPABASE_SERVICE_ROLE),
     }
 
-# ping baratísimo: no toca DB ni OpenAI
+# 204 No Content SIN body (para evitar "Response content longer than Content-Length")
 @app.get("/keepalive")
 def keepalive():
-    # 204 No Content => sin body
-    return JSONResponse(status_code=204)
+    return Response(status_code=204)
 
-# ---- ASR (Whisper) ----
+# ──────────────────────────────────────────────────────────────────────────────
+# ASR (Whisper)
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/asr")
 async def asr(audio: UploadFile = File(...), language: str = Form("en")):
     if not OPENAI_API_KEY:
-        return JSONResponse({"error": "OPENAI_API_KEY is empty"}, status_code=500)
+        return json_error("server_misconfig", "OPENAI_API_KEY is empty", 500)
 
     fname = audio.filename or "audio.webm"
     ctype = audio.content_type or "audio/webm"
@@ -117,154 +81,63 @@ async def asr(audio: UploadFile = File(...), language: str = Form("en")):
 
     try:
         content = await audio.read()
-        r = await http_client.post(
-            "https://api.openai.com/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            data=data,
-            files={"file": (fname, content, ctype)},
-        )
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(
+                f"{OPENAI_BASE}/audio/transcriptions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                data=data,
+                files={"file": (fname, content, ctype)},
+            )
         if r.status_code != 200:
             print("ASR ERROR", r.status_code, r.text[:500])
-            return JSONResponse(
-                {"error": "openai_asr_failed", "status": r.status_code, "detail": r.text},
-                status_code=500,
-            )
+            return json_error("openai_asr_failed", r.text, 500)
         j = r.json()
         return {"text": j.get("text", "")}
     except Exception as e:
         print("ASR EXCEPTION", repr(e))
-        return JSONResponse({"error": "server_exception", "detail": str(e)}, status_code=500)
+        return json_error("server_exception", str(e), 500)
 
-
-# ---- CHAT (Correcciones bilingües guiadas y humanizador de texto) ----
-def clean_for_speech(text: str) -> str:
-    """
-    Quita bullets, numeraciones y markdown que suenan robóticos en TTS.
-    Convierte a un párrafo fluido.
-    """
-    # quita bullets tipo "-", "*", "•", "–" al inicio de línea
-    text = re.sub(r'^\s*[-*•–]\s+', '', text, flags=re.MULTILINE)
-    # quita numeraciones "1) ", "2. ", "3 - " al inicio de línea
-    text = re.sub(r'^\s*\d+[\)\.\-:]\s+', '', text, flags=re.MULTILINE)
-    # colapsa múltiples saltos de línea a uno
-    text = re.sub(r'\n{2,}', '\n', text)
-    # si aún quedan saltos, junta a un párrafo corto
-    text = ' '.join(line.strip() for line in text.splitlines())
-    # cleanup espacios múltiples
-    text = re.sub(r'\s{2,}', ' ', text).strip()
-    return text
-
-@app.post("/chat")
-async def chat(
-    prompt: str = Form(...),
-    native_language: str = Form("es"),   # "es" para explicaciones
-    target_language: str = Form("en")    # "en" para práctica
-):
-    if not OPENAI_API_KEY:
-        return JSONResponse({"error": "OPENAI_API_KEY is empty"}, status_code=500)
-
-    # Instrucciones: tono cálido, 2–4 frases, nada de listas ni numeración.
-    system = (
-        "You are a warm, human language coach. Speak naturally, like a friendly teacher.\n"
-        "Rules:\n"
-        "- Write a single short paragraph (2–4 sentences). No lists. No numbering. No headings.\n"
-        f"- Explain in the student's NATIVE language.\n"
-        "- Include the corrected TARGET-language sentence inline (surrounded by quotes) and give a brief phonetic/intonation hint.\n"
-        "- Keep it concise and encouraging."
-    )
-
-    user_content = (
-        f"NATIVE={native_language}; TARGET={target_language}; "
-        f"Student just said (in TARGET): {prompt}"
-    )
-
-    body = {
-        "model": "gpt-4o-mini",
-        "temperature": 0.5,  # un poco de calidez
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_content}
-        ]
-    }
-
-    r = await http_client.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        json=body
-    )
-    if r.status_code != 200:
-        return JSONResponse({"error": "openai_chat_failed", "detail": r.text}, status_code=500)
-
-    out = r.json()
-    raw = out["choices"][0]["message"]["content"]
-    natural = clean_for_speech(raw)
-    return {"text": natural}
-
-# ---- TTS (Audio de respuesta) ----
-def pace_slow(text: str) -> str:
-    """
-    Inserta pausas suaves para que el TTS suene más pausado.
-    Estrategia simple: coma cada 2–3 palabras y puntos suaves al final de frases.
-    """
-    # Normaliza espacios
-    text = re.sub(r'\s+', ' ', text).strip()
-    words = text.split(' ')
-    out = []
-    count = 0
-    for w in words:
-        out.append(w)
-        count += 1
-        if count in (2, 5, 8):
-            out.append(',')  # pausas cortas
-        if count >= 10:
-            out.append('.')
-            count = 0
-    s = ' '.join(out)
-    # Limpia posibles ", ." secuencias
-    s = re.sub(r'\s+,', ', ', s)
-    s = re.sub(r'\s+\.', '. ', s)
-    return s.strip()
-
+# ──────────────────────────────────────────────────────────────────────────────
+# TTS (Aria para EN, Lumen para ES)  ← NUEVO
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/tts")
-async def tts(
-    text: str = Form(...),
-    voice: str = Form("alloy"),
-    format: str = Form("mp3"),
-    pace: str = Form("normal"),  # <-- nuevo: "normal" | "slow"
-):
+async def tts(text: str = Form(...), language: str = Form("en")):
     if not OPENAI_API_KEY:
-        return JSONResponse({"error": "OPENAI_API_KEY is empty"}, status_code=500)
+        return json_error("server_misconfig", "OPENAI_API_KEY is empty", 500)
 
-    speak_text = text if pace == "normal" else pace_slow(text)
+    # Selección de voz por idioma
+    lang = (language or "").lower()
+    if lang.startswith("en"):
+        voice = "aria"   # recomendada para inglés (cálida, estilo profesora)
+    elif lang.startswith("es"):
+        voice = "lumen"  # recomendada para español (clara y natural)
+    else:
+        voice = "alloy"  # fallback neutral
 
-    data = {"model": "gpt-4o-mini-tts", "voice": voice, "input": speak_text, "format": format}
-    r = await http_client.post(
-        "https://api.openai.com/v1/audio/speech",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-        json=data
-    )
-    if r.status_code != 200:
-        return JSONResponse({"error": "openai_tts_failed", "detail": r.text}, status_code=500)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{OPENAI_BASE}/audio/speech",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                json={
+                    "model": "gpt-4o-mini-tts",
+                    "voice": voice,
+                    "input": text,
+                },
+            )
+        if r.status_code != 200:
+            print("TTS ERROR", r.status_code, r.text[:500])
+            return json_error("openai_tts_failed", r.text, 500)
 
-    media = "audio/mpeg" if format == "mp3" else "audio/wav"
-    return StreamingResponse(iter([r.content]), media_type=media)
+        # audio/mpeg (mp3)
+        return Response(r.content, media_type="audio/mpeg")
+    except Exception as e:
+        print("TTS EXCEPTION", repr(e))
+        return json_error("server_exception", str(e), 500)
 
-# CLASES DE CONVERSACION
-
-def lesson_coach_prompt(native: str, target: str, step_goal: str, expect_keywords: list[str]) -> str:
-    return (
-        "You are a warm language teacher. You will: (1) evaluate the student's TARGET-language utterance, "
-        " (2) respond in the student's NATIVE language with a short, natural paragraph (no lists), "
-        " (3) include one corrected TARGET sentence in quotes, and (4) return a JSON control block.\n\n"
-        "Return a JSON object with keys: teacher_feedback, corrected_sentence, score, need_repeat.\n"
-        "- teacher_feedback: short paragraph in NATIVE.\n"
-        "- corrected_sentence: one concise sentence in TARGET, quoted.\n"
-        "- score: 0.0–1.0 based on how well they achieved the goal.\n"
-        "- need_repeat: true if they should try again; false if they can move on.\n\n"
-        f"Context:\nNATIVE={native}; TARGET={target}; STEP_GOAL={step_goal}; EXPECT_KEYWORDS={expect_keywords}.\n"
-        "Be strict but kind. If key info is missing, set need_repeat=true.\n"
-    )
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Lessons: start / turn
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/lesson/start")
 async def lesson_start(
     user_id: UUID = Form(...),
@@ -276,7 +149,7 @@ async def lesson_start(
     if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE):
         return json_error("server_misconfig", "Supabase URL or Service Role missing", 500)
 
-    # 1) Crea la sesión en Supabase
+    # 1) Crear sesión en Supabase
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
@@ -299,7 +172,7 @@ async def lesson_start(
         print("SUPABASE START EXC:", repr(e))
         return json_error("supabase_exception", str(e), 500)
 
-    # 2) Pedir intro al LLM (opcional; si falla, devolvemos vacío)
+    # 2) Intro del LLM (opcional; si falla, no bloqueamos)
     intro = ""
     if OPENAI_API_KEY:
         system = (
@@ -330,19 +203,15 @@ async def lesson_start(
             if r.status_code == 200:
                 j = r.json()
                 intro = j["choices"][0]["message"]["content"].strip()
-            else:
-                # no bloquees el flujo si el LLM falla
-                pass
         except Exception as e:
             print("LLM START EXC:", repr(e))
-            # intro se queda ""
+            # intro sigue vacío sin bloquear
 
     return {
         "lesson_id": lesson_id,
         "step_index": 0,
         "teacher_text_native": intro,
     }
-
 
 @app.post("/lesson/turn")
 async def lesson_turn(
@@ -358,7 +227,7 @@ async def lesson_turn(
     teacher_feedback = ""
     corrected_sentence = ""
 
-    # 1) LLM feedback JSON
+    # 1) LLM feedback (JSON estricto)
     if OPENAI_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -395,7 +264,7 @@ async def lesson_turn(
         except Exception as e:
             print("LLM TURN EXC:", repr(e))
 
-    # 2) Guardar turno en Supabase
+    # 2) Guardar turno
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             ins = await client.post(
@@ -418,12 +287,15 @@ async def lesson_turn(
         print("SUPABASE TURN EXC:", repr(e))
         return json_error("supabase_exception", str(e), 500)
 
+    # 3) Regla simple de avance
     advanced = len(user_text.split()) >= 6
     next_step_index = step_index + 1 if advanced else step_index
     next_teacher_text_native = (
         "Excelente. Ahora intenta pedir la bebida con una frase completa y cortés."
-        if advanced and native_language.startswith("es") else
-        "Great. Now try to order a drink using a complete and polite sentence." if advanced else ""
+        if advanced and native_language.startswith("es")
+        else "Great. Now try to order a drink using a complete and polite sentence."
+        if advanced
+        else ""
     )
 
     return {
@@ -434,17 +306,3 @@ async def lesson_turn(
         "next_step_index": next_step_index,
         "next_teacher_text_native": next_teacher_text_native,
     }
-
-
-
-@app.post("/lesson/finish")
-async def lesson_finish(lesson_id: str = Form(...)):
-    async with httpx.AsyncClient() as c:
-        r = await c.patch(
-            f"{SUPABASE_URL}/rest/v1/lesson_sessions?id=eq.{lesson_id}",
-            headers=supabase_headers, json={"status":"completed"}
-        )
-        if r.status_code not in (200,204):
-            return JSONResponse({"error":"supabase_finish_failed","detail":r.text}, status_code=500)
-    return {"ok": True}
-
