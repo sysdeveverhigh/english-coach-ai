@@ -1,326 +1,355 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
-import { supabase } from "@/lib/supabaseClient";
 
-const MAX_MS = 15000;
+import { useCallback, useEffect, useRef, useState } from "react";
+import { resolveVoice } from "@/lib/voices";
 
-// Tipo mínimo para evitar "any" en ondataavailable (algunas TS libs no traen BlobEvent)
-interface BlobEventLike extends Event {
-  data: Blob;
+type UUID = string & { readonly __brand: unique symbol };
+
+interface StartResp {
+  lesson_id: UUID;
+  step_index: number;
+  teacher_text_native: string;
 }
 
-export default function RestaurantLesson() {
-  const [lessonId, setLessonId] = useState<string>("");
+interface TurnResp {
+  teacher_feedback: string;
+  corrected_sentence: string;
+  advanced: boolean;
+  lesson_done: boolean;
+  next_step_index: number;
+  next_teacher_text_native: string;
+}
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
+
+export default function RestaurantLessonPage() {
+  // Config “rápida”: en el futuro saldrá del perfil del alumno
+  const [studentName] = useState<string>("Octavio");
+  const [nativeLang] = useState<"es" | "en">("es");   // idioma del feedback hablado
+  const [targetLang] = useState<"en" | "es">("en");   // idioma que practica
+
+  // Estado de la lección
+  const [lessonId, setLessonId] = useState<UUID | null>(null);
   const [stepIndex, setStepIndex] = useState<number>(0);
   const [teacherIntro, setTeacherIntro] = useState<string>("");
-  const [native, setNative] = useState("es");
-  const [target, setTarget] = useState("en");
-  const [userEmail, setUserEmail] = useState<string | null>(null);
 
-  // grabación/estado
-  const [isRecording, setIsRecording] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [status, setStatus] = useState("");
-  const [userText, setUserText] = useState("");
-  const [feedback, setFeedback] = useState("");
-  const [corrected, setCorrected] = useState("");
+  // Estado de turno (resultado)
+  const [teacherFeedback, setTeacherFeedback] = useState<string>("");
+  const [correctedSentence, setCorrectedSentence] = useState<string>("");
 
-  // audio players
-  const [audioIntro, setAudioIntro] = useState<string>("");
-  const [audioA, setAudioA] = useState<string>(""); // feedback nativo
-  const [audioB, setAudioB] = useState<string>(""); // corrected meta (slow)
-  const refIntro = useRef<HTMLAudioElement | null>(null);
-  const refA = useRef<HTMLAudioElement | null>(null);
-  const refB = useRef<HTMLAudioElement | null>(null);
+  // Audio players (un reproductor que reutilizamos)
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // timer
-  const [timerLeft, setTimerLeft] = useState<number>(MAX_MS / 1000);
+  // Grabación
+  const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [secondsLeft, setSecondsLeft] = useState<number>(15);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
   const timerRef = useRef<number | null>(null);
-  const stopTimeoutRef = useRef<number | null>(null);
-  const recRef = useRef<MediaRecorder | null>(null);
-  const chunks = useRef<BlobPart[]>([]);
 
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    (async () => {
-      const base = process.env.NEXT_PUBLIC_API_BASE!;
-      const { data: s } = await supabase.auth.getSession();
-      const session = s.session;
-      if (!session) {
-        window.location.href = "/login";
-        return;
-      }
-      setUserEmail(session.user.email ?? null);
-      const { data: p } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("user_id", session.user.id)
-        .maybeSingle();
-      if (!p) {
-        window.location.href = "/profile";
-        return;
-      }
-      setNative(p.native_lang || "es");
-      setTarget(p.target_lang || "en");
+  // Carga/errores UI
+  const [busy, setBusy] = useState<boolean>(false);
+  const [error, setError] = useState<string>("");
 
-      // inicia lección
-      const fd = new FormData();
-      fd.append("user_id", session.user.id);
-      fd.append("native_language", p.native_lang || "es");
-      fd.append("target_language", p.target_lang || "en");
-      fd.append("topic", "restaurant");
-      fd.append("student_name", p.full_name || "");
-      const r = await fetch(`${base}/lesson/start`, { method: "POST", body: fd });
-      const j = await r.json();
-      setLessonId(j.lesson_id);
-      setStepIndex(j.step_index);
-      setTeacherIntro(j.teacher_text_native);
-
-      // TTS intro (nativo)
-      const tfd = new FormData();
-      tfd.append("text", j.teacher_text_native);
-      tfd.append("voice", "alloy");
-      tfd.append("format", "mp3");
-      tfd.append("pace", "normal");
-      const tts = await fetch(`${base}/tts`, { method: "POST", body: tfd });
-      const ab = await tts.arrayBuffer();
-      const url = URL.createObjectURL(new Blob([ab], { type: "audio/mpeg" }));
-      setAudioIntro(url);
-      // autoplay
-      setTimeout(() => refIntro.current?.play().catch(() => {}), 200);
-    })();
+  // Helpers HTTP
+  const postForm = useCallback(async (url: string, fd: FormData): Promise<Response> => {
+    const r = await fetch(url, { method: "POST", body: fd });
+    return r;
   }, []);
 
-  const startCountdown = () => {
-    setTimerLeft(Math.round(MAX_MS / 1000));
-    if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = window.setInterval(() => setTimerLeft((s) => (s > 0 ? s - 1 : 0)), 1000);
-  };
+  // TTS con voz seleccionada por usuario (persistida en localStorage por /settings)
+  const ttsBlob = useCallback(async (text: string, lang: string): Promise<Blob> => {
+    const fd = new FormData();
+    fd.append("text", text);
+    fd.append("language", lang);
+    // dejamos que el backend elija la voz por defecto,
+    // pero si el usuario eligió una voz en /settings, resolveVoice la trae
+    const v = resolveVoice(lang);
+    fd.append("voice", v);
 
-  const startRec = async () => {
-    if (isRecording || isProcessing) return;
-    setUserText("");
-    setFeedback("");
-    setCorrected("");
-    setStatus("");
-
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    // Detección tipada de MediaRecorder (sin any)
-    let mimeType: string | undefined;
-    if (typeof MediaRecorder !== "undefined") {
-      if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
-        mimeType = "audio/webm;codecs=opus";
-      } else if (MediaRecorder.isTypeSupported("audio/webm")) {
-        mimeType = "audio/webm";
-      }
+    const r = await postForm(`${API_BASE}/tts`, fd);
+    if (!r.ok) {
+      throw new Error(`TTS failed: ${r.status}`);
     }
-    const mr = mimeType
-      ? new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 64000 })
-      : new MediaRecorder(stream);
+    return await r.blob();
+  }, [postForm]);
 
-    chunks.current = [];
-    mr.ondataavailable = (e: BlobEventLike) => {
-      if (e.data && e.data.size > 0) chunks.current.push(e.data);
-    };
+  const playBlob = useCallback(async (blob: Blob, autoplayDelayMs = 0): Promise<void> => {
+    if (!audioRef.current) audioRef.current = new Audio();
+    const a = audioRef.current;
+    a.src = URL.createObjectURL(blob);
 
-    mr.onstop = async () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-      if (stopTimeoutRef.current) clearTimeout(stopTimeoutRef.current);
-      setIsProcessing(true);
-      setStatus("Procesando…");
-      try {
-        const blob = new Blob(chunks.current, { type: mr.mimeType || "audio/webm" });
-        chunks.current = [];
+    await new Promise<void>((resolve) => {
+      const start = () => {
+        a.removeEventListener("canplaythrough", start);
+        window.setTimeout(() => {
+          a.play().catch(() => { /* ignorar bloqueo del navegador */ });
+          resolve();
+        }, autoplayDelayMs);
+      };
+      a.addEventListener("canplaythrough", start);
+    });
+  }, []);
 
-        const base = process.env.NEXT_PUBLIC_API_BASE!;
-        // ASR
-        const fd = new FormData();
-        fd.append("audio", blob, "input.webm");
-        fd.append("language", target);
-        const asr = await fetch(`${base}/asr`, { method: "POST", body: fd });
-        const asrJ = await asr.json();
-        if (!asr.ok) {
-          setStatus(`ASR ${asr.status}`);
-          setIsProcessing(false);
-          return;
-        }
-        setUserText(asrJ.text || "");
+  // Iniciar lección: crea sesión + reproduce consigna con autoplay (1.2s)
+  const startLesson = useCallback(async () => {
+    setBusy(true);
+    setError("");
+    setTeacherFeedback("");
+    setCorrectedSentence("");
+    try {
+      const fd = new FormData();
+      fd.append("user_id", crypto.randomUUID()); // para F&F puedes usar UUID efímero local
+      fd.append("native_language", nativeLang);
+      fd.append("target_language", targetLang);
+      fd.append("topic", "restaurant");
+      fd.append("student_name", studentName);
 
-        // TURN
-        const fd2 = new FormData();
-        fd2.append("lesson_id", lessonId);
-        fd2.append("step_index", String(stepIndex));
-        fd2.append("user_text", asrJ.text || "");
-        fd2.append("native_language", native);
-        fd2.append("target_language", target);
-        const tr = await fetch(`${base}/lesson/turn`, { method: "POST", body: fd2 });
-        const tj = await tr.json();
-        if (!tr.ok) {
-          setStatus(`TURN ${tr.status}`);
-          setIsProcessing(false);
-          return;
-        }
-        setFeedback(tj.teacher_feedback || "");
-        setCorrected(tj.corrected_sentence || "");
-
-        // TTS A (feedback nativo)
-        const fd3a = new FormData();
-        fd3a.append("text", tj.teacher_feedback || "");
-        fd3a.append("voice", "alloy");
-        fd3a.append("format", "mp3");
-        fd3a.append("pace", "normal");
-        const ttsa = await fetch(`${base}/tts`, { method: "POST", body: fd3a });
-        const abA = await ttsa.arrayBuffer();
-        const urlA = URL.createObjectURL(new Blob([abA], { type: "audio/mpeg" }));
-        setAudioA(urlA);
-
-        // TTS B (corrected, lento)
-        const fd3b = new FormData();
-        fd3b.append("text", (tj.corrected_sentence || "").replace(/^"+|"+$/g, ""));
-        fd3b.append("voice", "alloy");
-        fd3b.append("format", "mp3");
-        fd3b.append("pace", "slow");
-        const ttsb = await fetch(`${base}/tts`, { method: "POST", body: fd3b });
-        const abB = await ttsb.arrayBuffer();
-        const urlB = URL.createObjectURL(new Blob([abB], { type: "audio/mpeg" }));
-        setAudioB(urlB);
-
-        setStatus(
-          tj.lesson_done
-            ? `Lección lista ${tj.avg_score ? `(promedio ${tj.avg_score})` : ""} ✅`
-            : tj.advanced
-            ? "¡Bien! Avancemos al siguiente paso."
-            : "Repitamos este paso."
-        );
-
-        // autoplay: primero A, al terminar A reproducimos B
-        setTimeout(() => refA.current?.play().catch(() => {}), 200);
-
-        // Si avanzó, prepara siguiente intro
-        if (tj.advanced && tj.next_teacher_text_native) {
-          setStepIndex(tj.next_step_index);
-          const pfd = new FormData();
-          const base2 = process.env.NEXT_PUBLIC_API_BASE!;
-          pfd.append("text", tj.next_teacher_text_native);
-          pfd.append("voice", "alloy");
-          pfd.append("format", "mp3");
-          pfd.append("pace", "normal");
-          const pr = await fetch(`${base2}/tts`, { method: "POST", body: pfd });
-          const pab = await pr.arrayBuffer();
-          const purl = URL.createObjectURL(new Blob([pab], { type: "audio/mpeg" }));
-          setAudioIntro(purl);
-        }
-      } finally {
-        setIsProcessing(false);
+      const r = await postForm(`${API_BASE}/lesson/start`, fd);
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(`start failed: ${r.status} ${txt.slice(0, 200)}`);
       }
-    };
+      const data = (await r.json()) as StartResp;
+      setLessonId(data.lesson_id);
+      setStepIndex(data.step_index);
+      setTeacherIntro(data.teacher_text_native ?? "");
 
-    mr.start(250);
-    recRef.current = mr;
-    setIsRecording(true);
-    setStatus(`Grabando… (máx ${Math.round(MAX_MS / 1000)}s)`);
-    setTimerLeft(Math.round(MAX_MS / 1000));
-    startCountdown();
-    stopTimeoutRef.current = window.setTimeout(() => {
-      if (mr.state === "recording") mr.stop();
-    }, MAX_MS);
-  };
+      if (data.teacher_text_native) {
+        const b = await ttsBlob(data.teacher_text_native, nativeLang);
+        // autoplay tras un gesto del usuario (este handler lo dispara un click)
+        await playBlob(b, 1200);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "start error");
+    } finally {
+      setBusy(false);
+    }
+  }, [nativeLang, targetLang, studentName, postForm, ttsBlob, playBlob]);
 
-  const stopRec = () => {
-    const mr = recRef.current;
-    if (mr && mr.state === "recording") {
-      if (timerRef.current) clearInterval(timerRef.current);
-      if (stopTimeoutRef.current) clearTimeout(stopTimeoutRef.current);
+  // Grabación
+  const startRecording = useCallback(async () => {
+    setError("");
+    if (isRecording) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mr = new MediaRecorder(stream);
+      chunksRef.current = [];
+      mr.ondataavailable = (ev: BlobEvent) => {
+        if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
+      };
+      mr.onstop = () => {
+        // detener tracks
+        stream.getTracks().forEach(t => t.stop());
+      };
+      mediaRecorderRef.current = mr;
+      mr.start();
+      setIsRecording(true);
+      setSecondsLeft(15);
+
+      // contador & autostop a 15s
+      if (timerRef.current) window.clearInterval(timerRef.current);
+      timerRef.current = window.setInterval(() => {
+        setSecondsLeft((s) => {
+          if (s <= 1) {
+            // autostop
+            window.clearInterval(timerRef.current!);
+            timerRef.current = null;
+            stopRecording(); // llamamos stop
+            return 0;
+          }
+          return s - 1;
+        });
+      }, 1000);
+    } catch (e) {
+      setError("No se pudo iniciar el micrófono. Revisa permisos.");
+    }
+  }, [isRecording]);
+
+  const stopRecording = useCallback(() => {
+    if (!isRecording) return;
+    if (timerRef.current) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state !== "inactive") {
       mr.stop();
-      setStatus("Procesando…");
-      setIsRecording(false);
     }
-  };
+    setIsRecording(false);
+  }, [isRecording]);
+
+  // Enviar la respuesta: ASR → TURN → TTS (feedback nativo) → TTS (frase corregida en meta)
+  const processAnswer = useCallback(async () => {
+    if (!lessonId) {
+      setError("Primero inicia la lección.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+
+    try {
+      // blob del audio
+      const audioBlob = new Blob(chunksRef.current, { type: "audio/webm" });
+      if (audioBlob.size === 0) {
+        throw new Error("No se capturó audio.");
+      }
+
+      // 1) ASR
+      const asrFd = new FormData();
+      asrFd.append("audio", audioBlob, "answer.webm");
+      // ponemos el idioma meta para guiar el reconocimiento
+      asrFd.append("language", targetLang);
+
+      const asrResp = await postForm(`${API_BASE}/asr`, asrFd);
+      if (!asrResp.ok) {
+        const t = await asrResp.text();
+        throw new Error(`ASR failed: ${asrResp.status} ${t.slice(0, 200)}`);
+      }
+      const asrJson = (await asrResp.json()) as { text: string };
+      const userText = asrJson.text?.trim() ?? "";
+      if (!userText) throw new Error("No se reconoció texto en el audio.");
+
+      // 2) TURN
+      const turnFd = new FormData();
+      turnFd.append("lesson_id", lessonId);
+      turnFd.append("step_index", String(stepIndex));
+      turnFd.append("user_text", userText);
+      turnFd.append("native_language", nativeLang);
+      turnFd.append("target_language", targetLang);
+
+      const turnResp = await postForm(`${API_BASE}/lesson/turn`, turnFd);
+      if (!turnResp.ok) {
+        const t = await turnResp.text();
+        throw new Error(`TURN failed: ${turnResp.status} ${t.slice(0, 200)}`);
+      }
+      const turn = (await turnResp.json()) as TurnResp;
+      setTeacherFeedback(turn.teacher_feedback ?? "");
+      setCorrectedSentence(turn.corrected_sentence ?? "");
+
+      // 3) TTS feedback (idioma nativo)
+      if (turn.teacher_feedback) {
+        const fbBlob = await ttsBlob(turn.teacher_feedback, nativeLang);
+        await playBlob(fbBlob, 800); // leve pausa antes de hablar
+      }
+      // 4) TTS frase corregida (idioma meta)
+      if (turn.corrected_sentence) {
+        const corrBlob = await ttsBlob(turn.corrected_sentence, targetLang);
+        await playBlob(corrBlob, 600);
+      }
+
+      // No avanzamos stepIndex (lo tenemos congelado hasta nivel 2)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "error en el procesamiento");
+    } finally {
+      setBusy(false);
+    }
+  }, [lessonId, stepIndex, nativeLang, targetLang, postForm, ttsBlob, playBlob]);
+
+  // Limpieza al desmontar
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) window.clearInterval(timerRef.current);
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.src = "";
+      }
+      const mr = mediaRecorderRef.current;
+      if (mr && mr.state !== "inactive") mr.stop();
+    };
+  }, []);
 
   return (
-    <main className="p-6 space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Lección: Restaurante</h1>
+    <main className="max-w-2xl mx-auto p-6 space-y-5">
+      <header className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold">Lección: Restaurante</h1>
+        <a
+          href="/settings"
+          className="text-sm underline text-gray-700 hover:text-black"
+        >
+          Configurar voz
+        </a>
+      </header>
+
+      <section className="space-y-3">
         <div className="text-sm text-gray-600">
-          {userEmail} | {native}→{target}
+          Nativo: <b>{nativeLang.toUpperCase()}</b> · Meta: <b>{targetLang.toUpperCase()}</b>
         </div>
-      </div>
-
-      <div className="space-y-2">
-        <div className="text-sm text-gray-700">
-          Paso actual: <b>{stepIndex}</b>.{" "}
-          {isRecording && (
-            <>
-              Tiempo restante: <span className="font-mono">{timerLeft}s</span>
-            </>
-          )}
-        </div>
-
-        {/* Consigna de la profe (nativo) */}
-        <div className="bg-gray-50 p-3 rounded">
-          <div className="text-sm text-gray-700 mb-1">Consigna de la profesora</div>
-          <p className="text-sm">{teacherIntro}</p>
-          {audioIntro && (
-            <div className="mt-2">
-              <audio ref={refIntro} src={audioIntro} controls />
-            </div>
-          )}
-        </div>
-
-        <div className="space-x-2">
+        <div className="flex gap-3">
           <button
-            onClick={startRec}
-            disabled={isRecording || isProcessing}
-            className={`px-3 py-2 rounded text-white ${
-              isRecording || isProcessing ? "bg-gray-400" : "bg-black"
-            }`}
+            disabled={busy}
+            onClick={startLesson}
+            className="bg-black text-white rounded px-4 py-2 disabled:opacity-50"
           >
-            Grabar respuesta
-          </button>
-          <button onClick={stopRec} disabled={!isRecording} className="px-3 py-2 bg-gray-200 rounded">
-            Detener
+            Iniciar lección
           </button>
         </div>
+      </section>
 
-        <p className="text-sm text-gray-600">{status}</p>
+      {teacherIntro && (
+        <section className="p-3 border rounded bg-gray-50">
+          <div className="text-sm text-gray-500 mb-1">Profesora:</div>
+          <p>{teacherIntro}</p>
+        </section>
+      )}
 
-        <div className="space-y-2">
-          <p>
-            <b>Tú dijiste:</b> {userText}
-          </p>
-          <p>
-            <b>Profe:</b> {feedback}
-          </p>
-          {corrected && (
-            <p>
-              <b>Frase corregida:</b> “{corrected}”
-            </p>
-          )}
+      <section className="space-y-3">
+        <div className="text-sm text-gray-500">
+          Graba tu respuesta (máx. <b>15s</b>). El contador se detiene al presionar “Detener”.
         </div>
+        <div className="flex items-center gap-3">
+          {!isRecording ? (
+            <button
+              onClick={startRecording}
+              className="bg-green-600 text-white rounded px-4 py-2"
+              disabled={busy}
+            >
+              Grabar respuesta
+            </button>
+          ) : (
+            <button
+              onClick={stopRecording}
+              className="bg-red-600 text-white rounded px-4 py-2"
+            >
+              Detener
+            </button>
+          )}
+          <div className="text-sm tabular-nums">
+            {isRecording ? `⏺ ${secondsLeft}s` : "⏹ listo"}
+          </div>
+          <button
+            onClick={processAnswer}
+            className="bg-blue-600 text-white rounded px-4 py-2 disabled:opacity-50"
+            disabled={busy || isRecording || !lessonId}
+            title={!lessonId ? "Primero inicia la lección" : ""}
+          >
+            Enviar respuesta
+          </button>
+        </div>
+      </section>
 
-        {/* Doble TTS */}
-        <div className="space-y-2">
-          {audioA && (
-            <div>
-              <div className="text-sm text-gray-700 mb-1">Explicación (nativo)</div>
-              <audio
-                ref={refA}
-                src={audioA}
-                controls
-                onEnded={() => {
-                  if (audioB) refB.current?.play().catch(() => {});
-                }}
-              />
+      {(teacherFeedback || correctedSentence) && (
+        <section className="grid gap-3">
+          {teacherFeedback && (
+            <div className="p-3 border rounded bg-amber-50">
+              <div className="text-sm text-gray-500 mb-1">Feedback de la profesora:</div>
+              <p>{teacherFeedback}</p>
             </div>
           )}
-          {audioB && (
-            <div>
-              <div className="text-sm text-gray-700 mb-1">Shadowing (meta, lento)</div>
-              <audio ref={refB} src={audioB} controls />
+          {correctedSentence && (
+            <div className="p-3 border rounded bg-emerald-50">
+              <div className="text-sm text-gray-500 mb-1">Oración corregida ({targetLang.toUpperCase()}):</div>
+              <p className="font-medium">{correctedSentence}</p>
             </div>
           )}
+        </section>
+      )}
+
+      {error && (
+        <div className="p-3 border rounded bg-red-50 text-red-700">
+          {error}
         </div>
-      </div>
+      )}
     </main>
   );
 }
